@@ -1,7 +1,11 @@
-# FactorGenAgent — runtime dependencies (see README for CUDA/MPS notes)
-# Install: pip install -r requirements.txt
+# FactorGenAgent runtime dependencies
+# Install with: pip install -r requirements.txt
 #
-# Faiss: use faiss-cpu by default. For GPU builds, see https://github.com/facebookresearch/faiss/wiki/Faiss-on-the-GPU
+# Notes:
+# - This list is aligned with the current Python source under agents/, utils/,
+#   main.py, and run.py.
+# - The local embedding model files under hub/ are not installed by pip.
+# - If you want GPU Faiss, replace faiss-cpu with a compatible GPU build.
 
 openai>=1.40.0
 pandas>=2.0.0

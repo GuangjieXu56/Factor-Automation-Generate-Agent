@@ -1,1 +1,0 @@
-{"ts": "2026-03-28T10:42:26.532028Z", "stage": "kea.prepare_context", "error": "argument of type 'WindowsPath' is not iterable", "extra": {"pdf_path": "data/sample1.pdf", "query": "Constrcut a factor"}}

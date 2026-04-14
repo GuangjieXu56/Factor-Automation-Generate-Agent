@@ -1,6 +1,20 @@
 # FactorGenAgent
 
-面向量化因子研究的智能体流水线：从 PDF 文档中检索相关知识，由大语言模型（LLM）生成**严格受约束的因子表达式**，再在面板数据上**解析、执行**并可选计算**横截面 IC（Pearson）**。
+面向量化因子研究的多智能体流水线：从 PDF 文档中检索候选知识，由 `KnowledgeExtractAgent`生成因子表达式，经 `FactorConstructAgent` 解析执行并回测后，再由 `JudgeAgent` 做一致性裁决，最终导出可直接用于下游选股与组合构建的确认因子。
+
+
+
+---
+
+## 核心能力
+
+- 从论文、研报等 PDF 中抽取与因子构造相关的上下文片段
+- 基于字段白名单与算子白名单，生成严格受约束的符号因子表达式
+- 在面板数据上解析并执行表达式，生成因子值
+- 计算横截面 IC（Pearson）作为基础回测结果
+- 对多个模型生成的结果做因子数量和数值级一致性校验
+- 将不一致信息回灌到下一轮生成，提升跨模型收敛概率
+- 将确认通过的因子与运行元数据导出为结构化产物
 
 ---
 
@@ -8,159 +22,321 @@
 
 ```mermaid
 flowchart LR
-  subgraph ingest [Ingest]
-    PDF[PDF 文档]
-    Parquet[Parquet 面板数据]
-  end
+  PDF[PDF 文档] --> Shared[共享上下文<br/>read_pdf + RAG]
+  Shared --> M1[模型分支 A<br/>KEA]
+  Shared --> M2[模型分支 B<br/>KEA]
+  Shared --> M3[更多模型分支<br/>KEA]
 
-  subgraph kea [KEA]
-    RAG[RAG 检索]
-    LLM[LLM 生成 JSON 指令]
-  end
+  M1 --> F1[FCA 解析执行]
+  M2 --> F2[FCA 解析执行]
+  M3 --> F3[FCA 解析执行]
 
-  subgraph fca [FCA]
-    Parse[interpreter 解析表达式]
-    Exec[interpreter 执行节点树]
-    BT[backtest IC]
-  end
+  F1 --> B1[可选 IC 回测]
+  F2 --> B2[可选 IC 回测]
+  F3 --> B3[可选 IC 回测]
 
-  PDF --> RAG
-  RAG --> LLM
-  LLM -->|instruction JSON| Parse
-  Parquet --> Exec
-  Parse --> Exec
-  Exec -->|因子面板| BT
-  Parquet --> BT
+  B1 --> Judge[JudgeAgent 一致性裁决]
+  B2 --> Judge
+  B3 --> Judge
+
+  Judge -->|一致| Export[导出确认因子与运行产物]
+  Judge -->|不一致| Feedback[生成 judge feedback]
+  Feedback --> M1
+  Feedback --> M2
+  Feedback --> M3
 ```
 
-**数据流简述**
+### 工作流说明
 
-1. **KEA**（`KnowledgeExtractAgent`）：读 PDF → 文本切块 → 向量检索（RAG）→ 调用 LLM，输出因子 JSON（含 `expression` 等）。
-2. **FCA**（`FactorConstructAgent`）：读 Parquet 面板 → 用 `interpreter` 将 `expression` 解析为内部节点树 → 在数据上执行 → 得到每个因子的面板结果；`backtest` 用 `ChangeRatio` 计算逐日 IC。
-3. **main**：串联 KEA → FCA；若 FCA 返回 `ok: false`，将 `feedback` 回传给下一轮 KEA。
-
-**错误与重试**
-
-- 多处异常会调用 `utils/error_utils.record_error_event`，追加写入项目根目录下的 **`error_events.jsonl`**（JSON Lines，一行一个事件）。
-- FCA 在解析/执行失败时返回 `feedback`（由 `build_retry_feedback` 生成），供 main 回灌 KEA。
-
----
-
-## 目录与文件说明
-
-### 入口与编排
-
-| 路径 | 作用 |
-|------|------|
-| [`main.py`](main.py) | 编排 `KEA` → `FCA` 的循环；FCA 失败时把 `feedback` 传给下一轮 KEA；成功时汇总 `factor_name`、`instruction` 子项、`df_factor`、`backtest`。 |
-| [`main.ipynb`](main.ipynb) | Notebook 实验/演示（非运行必需）。 |
-
-### 智能体（`agents/`）
-
-| 路径 | 作用 |
-|------|------|
-| [`agents/KnowledgeExtractAgent.py`](agents/KnowledgeExtractAgent.py) | **KEA**：加载 `configs/fields.json` 与 `configs/operators.json` 注入 system prompt；`extract_knowledge` 完成 PDF+RAG+LLM，解析 JSON 返回 instruction。`feedback` 拼入 **user 侧内容**。 |
-| [`agents/FactorConstructAgent.py`](agents/FactorConstructAgent.py) | **FCA**：`handle_instruction` 解析并执行表达式；`backtest` 计算 Pearson IC（因子与下一期收益对齐）。 |
-| [`agents/__init__.py`](agents/__init__.py) | 包初始化占位。 |
-
-### 工具与解释器（`utils/`）
-
-| 路径 | 作用 |
-|------|------|
-| [`utils/tools.py`](utils/tools.py) | `read_pdf`（pdfplumber）、`rag_search`（分块 + SentenceTransformer 编码 + Faiss 检索）、`call_llm_api`（OpenAI 兼容客户端调用网关）。异常时记录 `error_events.jsonl` 后重新抛出。 |
-| [`utils/interpreter.py`](utils/interpreter.py) | **表达式解释器**：`parse_expression_to_node`（AST → 内部节点字典）、`execute_node`（在 DataFrame 上按算子递归计算）。字段/算子白名单来自 `configs/*.json`。执行层 pivot 使用 **`Trddt` / `Stkcd`**（与 FCA、回测一致）。 |
-| [`utils/error_utils.py`](utils/error_utils.py) | 统一错误日志：`record_error_event`、`build_retry_feedback`；日志文件为项目根目录 **`error_events.jsonl`**。 |
-| [`utils/__init__.py`](utils/__init__.py) | 包初始化占位。 |
-
-### 配置（`configs/`）
-
-| 路径 | 作用 |
-|------|------|
-| [`configs/fields.json`](configs/fields.json) | 允许出现在因子表达式中的**数据字段**及英文说明（如 `Stkcd`、`Trddt`、`Clsprc`、`ChangeRatio` 等）。KEA 的 prompt 会嵌入该 JSON；`interpreter` 启动时加载，**表达式里的 `Name` 必须属于这些 key**。 |
-| [`configs/operators.json`](configs/operators.json) | 允许的**算子**及 `signature`、说明；用于 AST 解析时的 arity 推断与约束。 |
-
-### 本地模型与向量缓存（`hub/`）
-
-| 路径 | 作用 |
-|------|------|
-| [`hub/`](hub/) | **本仓库内的 SentenceTransformer / Hugging Face Hub 风格本地模型目录**，供 KEA 的 RAG 阶段加载嵌入模型。本项目使用 `BAAI/bge-m3` 从 Hugging Face 下载后放入此目录下。 |
-
-
-### 其他
-
-| 路径 | 作用 |
-|------|------|
-| [`.vscode/settings.json`](.vscode/settings.json) | VS Code / Cursor 本地 Python 环境相关设置。 |
-| [`data/`](data/) | 放置示例 PDF、Parquet 等数据。 |
-| [`error_events.jsonl`](error_events.jsonl) | 运行期由 `utils/error_utils.py` 追加写入的统一错误事件日志（项目根目录）。 |
+1. `JudgeAgent` 先读取 PDF，并执行一次共享 RAG 检索。
+2. 多个候选模型在同一份shared context上分别调用 `KnowledgeExtractAgent` 生成 JSON 因子指令。
+3. 每个模型分支将指令交给 `FactorConstructAgent`，解析表达式并在 Parquet 面板数据上执行。
+4. 若执行成功，可进一步计算每个因子的 IC 序列。
+5. `JudgeAgent` 对所有成功分支做一致性裁决：
+   - 先检查是否全部 `no_factor`
+   - 再检查是否有分支失败
+   - 再检查因子数量是否一致
+   - 最后检查对应因子的数值结果是否在容差内一致
+6. 若不一致，`JudgeAgent` 会构造 `judge_feedback` 并进入下一轮 refinement。
+7. 若一致，系统将确认因子，并导出供下游使用的结构化文件。
 
 ---
 
-## 数据
+## 模块说明
 
-### Parquet（FCA 默认示例数据 `/data/stock_data.parquet`）
+### 主入口
 
-- **完整日频量价数据**：https://cloud.tsinghua.edu.cn/d/9a6da85cc45c46ea9e79/
-- **长表**：每行一只股票在一个交易日的观测。
-- **执行与回测当前实现依赖的列名**（与 `interpreter` / `FCA.backtest` 一致）：
-  - `Trddt`：交易日期  
-  - `Stkcd`：证券代码  
-  - 因子表达式中引用的字段名须与 **`configs/fields.json` 的 key** 一致，且 Parquet 中需存在对应列（例如 `Clsprc`、`ChangeRatio` 等）。  
-- **回测**：`FCA.backtest` 使用 `ChangeRatio` pivot 成宽表，再 **`shift(-1)`**，表示用 **t 日因子值** 与 **t+1 日收益** 做横截面 Pearson 相关，得到按 `Trddt` 的 **IC 序列**。
+| 路径 | 作用 |
+|------|------|
+| [`run.py`](run.py) | 当前推荐入口。负责解析命令行参数、运行 `JudgeAgent`、导出运行产物到 `factor_runs/`。 |
+| [`main.ipynb`](main.ipynb) | Notebook 实验入口。 |
 
----
+### 智能体
 
-## `main.py` 参数说明
+| 路径 | 作用 |
+|------|------|
+| [`agents/KnowledgeExtractAgent.py`](agents/KnowledgeExtractAgent.py) | `KEA`：加载 `configs/fields.json` 与 `configs/operators.json` 构造 prompt，执行 PDF + RAG + LLM 生成因子 JSON。 |
+| [`agents/FactorConstructAgent.py`](agents/FactorConstructAgent.py) | `FCA`：解析表达式、执行因子计算，并提供 `backtest` 计算横截面 IC。 |
+| [`agents/JudgeAgent.py`](agents/JudgeAgent.py) | `JA`：共享上下文、驱动多模型分支、比较因子结果、生成 judge feedback、持久化确认结果或错误历史。 |
 
-### `run_pipeline(...)`
 
-| 参数 | 类型 | 默认值 | 含义 |
-|------|------|--------|------|
-| `pdf_path` | `str` | （必填） | 传给 KEA 的 PDF 路径（如 `data/sample1.pdf`）。 |
-| `query` | `str` | （必填） | RAG 与任务描述用查询文本。 |
-| `model` | `str` | `"DeepSeek-V3.2"` | LLM 名称，须为 `utils/tools.call_llm_api` 白名单之一。 |
-| `max_rounds` | `int` | `5` | KEA→FCA 外层重试轮数；FCA 持续 `ok: false` 时最多重试次数。 |
+### 工具与底层执行
 
-**内部固定项（当前代码）**
+| 路径 | 作用 |
+|------|------|
+| [`utils/tools.py`](utils/tools.py) | `read_pdf`、`rag_search`、`call_llm_api`。 |
+| [`utils/interpreter.py`](utils/interpreter.py) | 表达式 AST 解析与节点执行器。 |
+| [`utils/error_utils.py`](utils/error_utils.py) | 统一错误日志记录与重试反馈构造。 |
 
-- `KEA()`：无额外构造参数。  
-- `FCA(parquet_path="/data/stock_data.parquet")`：面板数据路径写死在 `run_pipeline` 内；若需可配置，应改为函数参数或环境变量（可自行扩展）。
+### 配置与数据
 
-### `main()` 中示例调用
+| 路径 | 作用 |
+|------|------|
+| [`configs/fields.json`](configs/fields.json) | 表达式允许引用的字段白名单。 |
+| [`configs/operators.json`](configs/operators.json) | 表达式允许使用的算子白名单及签名约束。 |
+| [`data/`](data/) | 示例 PDF 和示例数据目录。 |
+| [`hub/`](hub/) | 本地嵌入模型目录，当前默认使用 `BAAI/bge-m3`。 |
 
-当前 `main()` 使用：
+### 运行产物
 
-- `pdf_path="data/sample1.pdf"`
-- `query="construct a factor"`
-- `model="DeepSeek-V3.2"`
-- `max_rounds=5`
-
-### `run_pipeline` 返回值（当前实现）
-
-- **成功且 FCA `ok: true`**：`{"ok": true, "results": [ ... ]}`  
-  每个元素包含：`factor_name`、`instruction`（该因子对应的 dict）、`df_factor`（该因子堆叠后的 DataFrame）、`backtest`（IC 序列 `pd.Series`）。
-- **`no_factor`**：`{"ok": true, "message": "...", "instruction": ...}`
-- **失败**：`{"ok": false, "error": "...", "last_instruction": ..., "last_fca_result": ...}`
-
+| 路径 | 作用 |
+|------|------|
+| [`judgement_output/`](judgement_output/) | Judge 级别的持久化结果，包括确认因子、回测文件、确认历史与错误历史。 |
+| [`factor_runs/`](factor_runs/) | 每次通过 `run.py` 启动后的独立运行目录，便于下游消费与审计。 |
+| [`error_events.jsonl`](error_events.jsonl) | 全局错误事件日志。 |
 
 ---
 
-## 依赖与环境（概览）
+## JudgeAgent 的一致性判定逻辑
 
-运行前需自行安装 Python 依赖，典型包括：
+`JudgeAgent.compare_models(...)` 当前会输出以下几类决策：
 
-- `pandas`、`numpy`、`pdfplumber`、`faiss-cpu`（或 `faiss-gpu`）、`langchain-text-splitters`、`openai`、`sentence-transformers`  
-- **本地向量模型**：默认使用项目内 [`hub/`](hub/) 下的完整模型目录。
-**安全提示**：`utils/tools.py` 内含 API 密钥与网关地址，生产环境应改为环境变量或配置文件，且勿提交到公开仓库。
+| decision | 含义 |
+|------|------|
+| `all_models_returned_no_factor` | 所有模型都认为无法构造有效因子，视为一致。 |
+| `models_failure` | 至少一个模型分支在生成、解析或执行阶段失败。 |
+| `no_factor_conflict` | 部分模型返回 `no_factor`，其余模型却构造出了可执行因子。 |
+| `factor_count_mismatch` | 各模型返回的最终可交易因子数量不同。 |
+| `factor_value_mismatch` | 因子数量一致，但对应因子的数值结果不一致。 |
+| `consistent_factor_values` | 因子数量一致，且逐因子数值比较通过，判定为最终一致。 |
+
+### 数值一致性的判断标准
+
+两个模型对同一因子的结果只有在以下条件同时满足时，才会被视为一致：
+
+- `(Trddt, Stkcd)` 索引集合完全一致
+- 缺失值分布模式一致
+- 没有只存在于单边的数据行
+- 重叠样本上的最大绝对误差不超过 `numeric_tolerance`
+
+默认容差为 `1e-5`，可通过 `run.py --numeric-tolerance` 调整。
 
 ---
 
-## 快速运行
+## 输入数据要求
 
-在项目根目录执行（需已配置好依赖、数据与模型路径）：
+### 1. PDF
+
+- 任意可被 `pdfplumber` 读取的 PDF 文件
+- 典型输入包括论文、策略说明、研报等
+
+### 2. 面板数据 Parquet
+
+`FCA` 和 `JudgeAgent` 默认使用 `--parquet-path /data/stock_data.parquet`。这里的 `/data/...` 不是系统根目录，而是会被解析为项目根目录下的相对路径，即：
+
+```text
+/data/stock_data.parquet
+=> <project_root>/data/stock_data.parquet
+```
+
+当前实现至少依赖以下列：
+
+- `Trddt`：交易日期
+- `Stkcd`：股票代码
+- `ChangeRatio`：下一期收益回测所需字段
+
+此外，因子表达式中引用的字段必须：
+
+- 出现在 [`configs/fields.json`](configs/fields.json) 中
+- 同时真实存在于 Parquet 文件列中
+
+### 3. 回测定义
+
+`FCA.backtest(...)` 当前实现的是逐日横截面 IC：
+
+- 将因子值按 `Trddt x Stkcd` 透视为宽表
+- 将 `ChangeRatio` 透视后执行 `shift(-1)`
+- 用 `t` 日因子值与 `t+1` 日收益做 Pearson 相关
+- 输出索引为 `Trddt` 的 IC 序列
+
+---
+
+## 环境与依赖
+
+安装依赖：
 
 ```bash
-python main.py
+pip install -r requirements.txt
 ```
 
+`requirements.txt` 当前包含的核心依赖有：
+
+- `openai`
+- `pandas`
+- `numpy`
+- `pdfplumber`
+- `faiss-cpu`
+- `langchain-text-splitters`
+- `sentence-transformers`
+- `torch`
+- `pyarrow`
+- `polars`
+
+### 模型与设备
+
+- RAG 嵌入模型默认从 [`hub/models--BAAI--bge-m3`](hub/models--BAAI--bge-m3) 加载
+- `JudgeAgent` 会优先使用 `mps`，其次 `cuda`，最后回退到 `cpu`
+- `KEA` 当前优先使用 `cuda`，否则使用 `cpu`
+
+### 支持的 LLM 名称
+
+`utils/tools.py` 当前对白名单模型做了限制，仅支持：
+
+- `DeepSeek-V3.2`
+- `Qwen3.5-27B`
+- `GLM-5`
+- `MiniMax-2.5`
+
+
+## 快速开始
+
+### 推荐用法：运行 JudgeAgent 主流程
+
+在项目根目录执行：
+
+```bash
+python run.py \
+  --pdf-path data/sample1.pdf \
+  --query "construct a factor" \
+  --models DeepSeek-V3.2 Qwen3.5-27B \
+  --parquet-path /data/stock_data.parquet
+```
+
+如果你想比较更多模型，可以继续追加：
+
+```bash
+python run.py \
+  --pdf-path data/sample1.pdf \
+  --query "construct a factor" \
+  --models DeepSeek-V3.2 Qwen3.5-27B GLM-5 MiniMax-2.5
+```
+
+
+## `run.py` 参数说明
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--pdf-path` | `str` | `data/sample1.pdf` | 输入 PDF 路径。 |
+| `--query` | `str` | `construct a factor` | RAG 检索与任务描述使用的查询文本。 |
+| `--models` | `list[str]` | `DeepSeek-V3.2 Qwen3.5-27B` | 参与裁决的模型列表，至少需要 2 个。 |
+| `--parquet-path` | `str` | `/data/stock_data.parquet` | 传给 `JudgeAgent` 的面板数据路径。 |
+| `--numeric-tolerance` | `float` | `1e-5` | 因子数值比较时的容差。 |
+| `--max-retries` | `int` | `5` | 单次 LLM 输出 JSON 解析失败后的最大重试次数。 |
+| `--max-rounds` | `int` | `2` | 单模型分支内部的 KEA/FCA refinement 最大轮数。 |
+| `--max-judge-iterations` | `int` | `3` | 多模型之间不一致时的 judge-level refinement 最大轮数。 |
+| `--export-root` | `str` | `factor_runs/` | 每次运行结果的导出根目录。 |
+
 ---
+
+## 输出目录说明
+
+### 1. `judgement_output/`
+
+由 `JudgeAgent` 直接维护，主要用于长期持久化：
+
+```text
+judgement_output/
+├── confirmed_factors/
+│   └── <timestamp>__factor_<idx>__<factor_name>.pkl
+├── backtests/
+│   └── <timestamp>__factor_<idx>__<factor_name>.csv
+├── confirmed_history.jsonl
+└── mistakes_history.jsonl
+```
+
+- `confirmed_history.jsonl`：记录所有判定一致的最终结果
+- `mistakes_history.jsonl`：记录不一致或失败的 judge 决策结果
+- `confirmed_factors/*.pkl`：确认因子的原始长表结果
+- `backtests/*.csv`：对应因子的 IC 回测结果
+
+### 2. `factor_runs/<timestamp>__<pdf_stem>/`
+
+由 `run.py` 在每次运行时导出，适合下游直接消费：
+
+```text
+factor_runs/<run_id>/
+├── decision.json
+├── manifest.json
+├── confirmed_factors.parquet
+├── iteration_history.json
+├── issue_report.json              # 仅不一致时存在
+└── factors/
+    └── 00__<factor_name>/
+        ├── factor_values_long.parquet
+        ├── factor_values_wide.parquet
+        ├── backtest.parquet       # 若存在回测
+        └── metadata.json
+```
+
+关键文件说明：
+
+- `decision.json`：完整 Judge 决策结果
+- `manifest.json`：面向下游消费的摘要索引
+- `confirmed_factors.parquet`：确认因子总表
+- `iteration_history.json`：每轮 judge iteration 的快照
+- `issue_report.json`：不一致原因说明
+- `metadata.json`：单因子元数据与存储路径
+
+---
+
+## 返回结果结构
+
+`JudgeAgent.run_ja(...)` 返回一个字典，核心字段包括：
+
+| 字段 | 含义 |
+|------|------|
+| `consistent` | 最终是否达成一致 |
+| `decision` | 本次 judge 的决策类型 |
+| `models` | 参与比较的模型列表 |
+| `model_reports` | 每个模型的状态、错误信息和输出因子摘要 |
+| `final_factors` | 最终确认通过的因子列表 |
+| `issue_report` | 不一致时的原因与细节 |
+| `judge_iteration` | 最终停留的 judge 轮次 |
+| `iteration_history` | 每轮 judge 决策快照 |
+| `latest_feedback` | 若未收敛，最后一次生成给下一轮的反馈文本 |
+
+当 `consistent == true` 时，`final_factors` 中的每个元素通常包含：
+
+- `factor_index`
+- `factor_name`
+- `expression`
+- `core_logic`
+- `data_source`
+- `source_models`
+- `expression_consensus`
+- `name_consensus`
+- `factor_value_path`
+- `backtest_path`
+
+---
+
+## 错误处理与重试
+
+- `utils/error_utils.record_error_event(...)` 会将错误统一追加写入 [`error_events.jsonl`](error_events.jsonl)
+- `FCA` 在表达式解析或执行失败时，会构造 `feedback` 返回给上游
+- `JudgeAgent` 在模型之间不一致时，会额外构造 `judge_feedback`，要求下一轮输出更收敛的结果
+- 单模型分支内的 refinement 由 `--max-rounds` 控制
+- 多模型之间的 refinement 由 `--max-judge-iterations` 控制
+
+---
+

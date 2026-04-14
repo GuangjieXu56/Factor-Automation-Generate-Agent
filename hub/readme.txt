@@ -1,1 +1,0 @@
-Use embedding model "BAAI/bge-m3" form Hugging Face.

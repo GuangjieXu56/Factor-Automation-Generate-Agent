@@ -104,3 +104,4 @@ class KEA:
                 extra={"pdf_path": pdf_path, "query": query, "model": model, "max_retries": max_retries},
             )
         return None
+    

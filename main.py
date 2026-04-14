@@ -88,7 +88,7 @@ def main():
         pdf_path="data/sample1.pdf",
         query="construct a factor",
         model="DeepSeek-V3.2",
-        max_rounds=5,
+        max_rounds=2,
     )
     print(result)
 

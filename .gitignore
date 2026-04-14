@@ -1,0 +1,37 @@
+# macOS / editor
+.DS_Store
+.vscode/
+
+# Python cache / build
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local runtime outputs
+error_events.jsonl
+factor_runs/
+judgement_output/
+tmp_run_export_test/
+
+# Local data artifacts
+*.pkl
+*.csv
+*.parquet
+
+# Local notebook scratch files
+.test.ipynb
+
+# Large local model cache
+hub/
