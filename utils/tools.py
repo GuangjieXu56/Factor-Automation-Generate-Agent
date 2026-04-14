@@ -82,7 +82,7 @@ def call_llm_api(model, system_content, assistant_content, user_content):
         raise ValueError(f"{model} can not be called! Please input the right model name!")
     try:
         client = OpenAI(
-            api_key="sk--PHwN3dC_IzMBR8CtBdieQ",
+            api_key="",
             base_url="https://llmapi.paratera.com"
         )
 
